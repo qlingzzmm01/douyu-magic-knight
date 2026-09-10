@@ -1,0 +1,35 @@
+# 缓存 / 产物
+__pycache__/
+*.pyc
+build/
+dist/
+dist_test/
+_build_tmp/
+
+# 登录态与运行数据（绝不入库）
+chrome_profile/
+魔法骑士自动挂机/chrome_profile/
+魔法骑士自动挂机/logs/
+魔法骑士自动挂机/run.log
+logs/
+run.log
+selftest.txt
+
+# 打包产物走 Release，不进仓库
+魔法骑士自动挂机/
+*.exe
+
+# 逆向 / 抓包临时素材
+probe/
+
+# Release 压缩包与打包暂存（走 Releases，不进仓库）
+*.zip
+_release_stage/
+
+# 工具本地数据
+.workbuddy/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
