@@ -29,6 +29,9 @@ _release_stage/
 # 工具本地数据
 .workbuddy/
 
+# 推广素材（本地大文件，不入库）
+promo/
+
 # 编辑器
 .vscode/
 .idea/

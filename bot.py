@@ -211,28 +211,69 @@ MOVE_BOT_JS = r"""
         else continue;
         ex += dx/d*k; ey += dy/d*k;
       }
-      // 掉落目标（分类各自独立，不互相短路）：宝箱>增益buff(1200内)>最近经验/掉落
+      // ---- 掉落目标（分类独立，不互相短路）----
+      // 分类依据 = 游戏内「带提示标签」的特殊掉落集合：
+      //   dropBox/dropEquipBox/dropRoleChip/dropSkillChip/dropFireJet/healPotion/pickup
+      // 优先级：宝箱(box/chest) > 稀有随机buff(磁铁pickup·火喷fireJet·血瓶healPotion·碎片chip)
+      //         > 经验(exp1~3)/金币(gold)
+      // ⚠️ 抽搐根因：玩家 moveSpeed 290~350，注入 tick 120ms -> 单帧位移 35~42 单位，
+      //   比拾取判定半径还大。贴身时每帧都会冲过头再回头 -> 原地来回摆。
+      //   对策：① 贴身死区 ② 卡住黑名单 ③ 软带降权 ④ 目标粘滞
       const drops = find(c=>c.__classname__==='dropProp' && c.isInit !== false);
       const dropTypes = G.dropTypes = G.dropTypes || {};
+      const RE_CHEST = /box|chest/i;
+      const RE_RARE  = /pickup|magnet|firejet|fire_jet|healpotion|heal_potion|chip|buff/i;
+      const DZ = 40;                          // 贴身死区：进入即停手，交给游戏自身拾取
+      const nearMap = G.nearMap = G.nearMap || {};
+      const skipMap = G.skipMap = G.skipMap || {};
+      // 卡住判定：贴到 70 以内 900ms 仍未消失 -> 认为该掉落捡不到，忽略 3 秒后再试
+      const reachable = (type, x, y, d) => {
+        const k = type + ':' + Math.round(x/60) + ',' + Math.round(y/60);
+        if (skipMap[k] && now < skipMap[k]) return false;
+        if (d > 70) { delete nearMap[k]; return true; }
+        const s = nearMap[k] || (nearMap[k] = now);
+        if (now - s > 900) { skipMap[k] = now + 3000; delete nearMap[k]; return false; }
+        return true;
+      };
       let cd=1e9, cx=0, cy=0;                 // 宝箱
-      let hbD=1e9, bfx=0, bfy=0;              // buff(1200内)
-      let ggD=1e9, ggx=0, ggy=0;              // 最近普通掉落
-      const isChest = (d) => /box|chest/i.test(String(d.type||'')) || /box|chest/i.test(String(d.node&&d.node.name||''));
-      const isBuff = (d) => /fire|mag|buff|power|dmg|double|shield|rage/i.test(
-        String(d.type||'') + ' ' + String(d.node&&d.node.name||''));
+      let rd=1e9, rx=0, ry=0;                 // 稀有（随机buff 类）
+      let ggD=1e9, ggx=0, ggy=0;              // 经验/金币
       for (const dr of drops) {
         const p=dr.node.worldPosition;
-        const dx=p.x-pp.x, dy=p.y-pp.y, d=Math.hypot(dx,dy)||1;
-        const t = String(dr.type||'?');
+        const ddx=p.x-pp.x, ddy=p.y-pp.y, d=Math.hypot(ddx,ddy);
+        const t = String(dr.type || (dr.node && dr.node.name) || '?');
         dropTypes[t] = (dropTypes[t]||0) + 1;
-        if (isChest(dr)) { if (d < cd) { cd=d; cx=dx/d; cy=dy/d; } }
-        else if (isBuff(dr)) { if (d < 1200 && d < hbD) { hbD=d; bfx=dx/d; bfy=dy/d; } }
-        else if (d < ggD) { ggD=d; ggx=dx/d; ggy=dy/d; }
+        if (!(d > DZ)) continue;              // 贴身死区：不再推进
+        const ux = ddx/d, uy = ddy/d;
+        if (RE_CHEST.test(t)) {
+          if (reachable('chest', p.x, p.y, d) && d < cd) { cd=d; cx=ux; cy=uy; }
+        } else if (RE_RARE.test(t)) {
+          if (reachable('rare', p.x, p.y, d) && d < rd) { rd=d; rx=ux; ry=uy; }
+        } else {
+          if (d < ggD) { ggD=d; ggx=ux; ggy=uy; }
+        }
       }
       G.chest = cd < 1e9 ? Math.round(cd) : 0;
-      G.buff = hbD < 1e9 ? Math.round(hbD) : 0;
+      G.rare  = rd < 1e9 ? Math.round(rd) : 0;
+      G.buff  = G.rare;                       // 兼容旧字段名（GUI/日志）
       G.nearestDrop = ggD < 1e9 ? Math.round(ggD) : 0;
-      const hasChest = cd < 1e9, hasBuff = hbD < 1e9;
+      if (Object.keys(skipMap).length > 300) {  // 防内存无限增长
+        for (const k in skipMap) if (skipMap[k] < now) delete skipMap[k];
+      }
+      const hasChest = cd < 1e9, hasRare = rd < 1e9, hasExp = ggD < 1e9;
+      // 软带降权：d>=180 全速，越近权重越低（配合死区，逼近过程不飘）
+      const near = (d) => Math.min(1, d / 180);
+      // 目标粘滞：同一目标 800ms 内锁定，避免两个等距目标来回切换
+      const goalDir = (type, ux, uy, d) => {
+        const gx0 = pp.x + ux*d, gy0 = pp.y + uy*d;
+        const prev = G.goal;
+        let g;
+        if (prev && prev.type === type && now < prev.until
+            && Math.hypot(prev.x - gx0, prev.y - gy0) < 240) g = prev;
+        else { g = {type: type, x: gx0, y: gy0, until: now + 800}; G.goal = g; }
+        const vx = g.x - pp.x, vy = g.y - pp.y, vd = Math.hypot(vx, vy) || 1;
+        return {ux: vx/vd, uy: vy/vd, d: vd};
+      };
 
       // ---- 精英猎杀向量：主动近身环绕输出清精英（仍受弹幕/贴脸保护优先）----
       let mdx=0, mdy=0, eliteMode=false, eliteD=1e9;
@@ -282,13 +323,24 @@ MOVE_BOT_JS = r"""
           else if (bd < 130) { dx =  ux*1.3 - uy*0.7;  dy =  uy*1.3 + ux*0.7; } // 稍退防推挤
           else               { dx = -uy*1.6 - ux*0.2;  dy =  ux*1.6 - uy*0.2; } // 环绕输出
         }
-        // 掉落物主动吃：宝箱 > 经验/血瓶（不限距离）> 增益 buff
-        if (hasChest)       { dx += cx*2.6; dy += cy*2.6; }
-        else if (ggD < 4000){ const w = bosses ? 1.3 : 2.6; dx += ggx*w; dy += ggy*w; }
-        else if (hasBuff)   { dx += bfx*2.0; dy += bfy*2.0; }
+        // 掉落物主动吃（分级 + 粘滞 + 近距衰减）：
+        //   宝箱 > 稀有随机buff(磁铁/火喷/血瓶/碎片) > 经验/金币
+        const gW = bosses ? 1.4 : 2.8;
+        let hunt = 'idle';
+        if (hasChest) {
+          const g = goalDir('chest', cx, cy, cd), k = 2.6*near(g.d);
+          dx += g.ux*k; dy += g.uy*k; hunt = 'chest';
+        } else if (hasRare && rd < 1600) {
+          const g = goalDir('rare', rx, ry, rd), k = gW*near(g.d);
+          dx += g.ux*k; dy += g.uy*k; hunt = 'rare';
+        } else if (hasExp && ggD < 4000) {
+          const g = goalDir('exp', ggx, ggy, ggD), k = gW*near(g.d);
+          dx += g.ux*k; dy += g.uy*k; hunt = 'exp';
+        }
+        if (bosses) hunt = 'boss+' + hunt;
         G.hunt = {enemies: enemies.length, nearest: Math.round(nearEnemy),
                   bosses: bosses, bossD: G.bossD,
-                  target: bosses ? 'boss' : (ggD < 4000 ? 'exp' : 'idle')};
+                  chest: G.chest, rare: G.rare, exp: G.nearestDrop, target: hunt};
       }
       else if (popOpen) { dx=0; dy=0; }
       else if (bThreat > 0.42) {
@@ -299,17 +351,22 @@ MOVE_BOT_JS = r"""
         // 主动猎杀精英（解锁升级）
         dx = mdx + ex*0.2 + bx*0.3; dy = mdy + ey*0.2 + by*0.3;
       }
-      else if (hasBuff) {
-        // 增益 buff：1200 内优先（普通小怪不挡路）
-        dx = bfx*2.8 + ex*0.3 + bx*0.5; dy = bfy*2.8 + ey*0.3 + by*0.5;
-      }
       else if (hasChest) {
-        // 宝箱：立即奔赴
-        dx = cx*3.0 + ex*0.3; dy = cy*3.0 + ey*0.3;
+        // 宝箱：最高优先（粘滞 + 近距衰减，避免贴身抽搐）
+        const g = goalDir('chest', cx, cy, cd);
+        dx = g.ux*3.0*near(g.d) + ex*0.3; dy = g.uy*3.0*near(g.d) + ey*0.3;
       }
-      else if (ggD < 1100) {
-        // 经验/掉落物：优先于躲普通小怪，直接奔（近的贴脸也吃）
-        dx = ggx*3.0 + ex*0.3 + bx*0.4; dy = ggy*3.0 + ey*0.3 + by*0.4;
+      else if (hasRare && rd < 1600) {
+        // 稀有随机buff（磁铁/火喷/血瓶/碎片）：专程去拿，优先级高于经验
+        const g = goalDir('rare', rx, ry, rd);
+        dx = g.ux*2.8*near(g.d) + ex*0.3 + bx*0.5;
+        dy = g.uy*2.8*near(g.d) + ey*0.3 + by*0.5;
+      }
+      else if (hasExp && ggD < 1100) {
+        // 经验/金币：优先于躲普通小怪，直接奔（近的贴脸也吃）
+        const g = goalDir('exp', ggx, ggy, ggD);
+        dx = g.ux*3.0*near(g.d) + ex*0.3 + bx*0.4;
+        dy = g.uy*3.0*near(g.d) + ey*0.3 + by*0.4;
       } else {
         // 无目标：被大群围(<90)才轻规避，否则等待
         dx = ex + bx; dy = ey + by;
@@ -544,7 +601,7 @@ JS_SNAPSHOT = r"""
              threatSeen: G.threatSeen ? Object.assign({}, G.threatSeen) : {},
              dropTypes: G.dropTypes ? Object.assign({}, G.dropTypes) : {},
              eliteMode: !!G.eliteMode, eliteD: G.eliteD, elites: G.elites,
-             chest: G.chest, buff: G.buff,
+             chest: G.chest, buff: G.buff, rare: G.rare,
              bosses: G.bosses, bossD: G.bossD, hunt: G.hunt};
   try {
     if (f) {
@@ -1137,6 +1194,7 @@ class MagicKnightBot:
                        "eliteMode": st.get("eliteMode"), "eliteD": st.get("eliteD"),
                        "elites": st.get("elites"),
                        "chest": st.get("chest"), "buff": st.get("buff"),
+                       "rare": st.get("rare"),
                        "dropTypes": st.get("dropTypes")}
                 if sk:
                     self._last_skills = sk       # 局末搭配快照用
@@ -1178,10 +1236,11 @@ class MagicKnightBot:
                                                  int(str(hud["gold"]).replace(",", "")))
                 except Exception:
                     pass
-                log("  局内 分钟=%s 击杀=%s 金币=%s 敌人=%s 最近=%s Boss=%s(%s) 血=%s 无敌=%s 弹窗=%s" %
+                log("  局内 分钟=%s 击杀=%s 金币=%s 敌人=%s 最近=%s Boss=%s(%s) 箱=%s 稀有=%s 距=%s 血=%s 无敌=%s 弹窗=%s" %
                     (hud.get("timer"), hud.get("kills"), hud.get("gold"),
                      st.get("enemies"), st.get("nearest"),
-                     st.get("bosses"), st.get("bossD"), st.get("hp"),
+                     st.get("bosses"), st.get("bossD"), st.get("chest"),
+                     st.get("rare"), st.get("nearestDrop"), st.get("hp"),
                      st.get("inv"), st.get("popups")))
         else:
             end_reason = "timeout"
