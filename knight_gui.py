@@ -237,14 +237,18 @@ def selftest():
         p("app_dir=%s" % botmod.APP_DIR)
         p("data_dir=%s" % botmod.DATA_DIR)
         p("chrome=%s" % (botmod.CHROME or "(none)"))
-        if not botmod.CHROME:
+        cands = botmod.chrome_candidates()
+        p("browser_candidates(rank 越小越优先):")
+        for c in cands:
+            p("  rank=%d prio=%d %s %s" % (c["rank"], c["prio"], c["exe"],
+                                           ("[" + "、".join(c["marks"]) + "]") if c["marks"] else ""))
+        if not cands:
             raise RuntimeError("未检测到 Chrome/Edge")
         from playwright.sync_api import sync_playwright
         pw = sync_playwright().start()
         p("driver=started")
-        ctx = pw.chromium.launch_persistent_context(
-            user_data_dir=botmod.PROFILE + "_selftest",
-            executable_path=botmod.CHROME, headless=False)
+        ctx, exe = botmod.launch_persistent(pw, botmod.PROFILE + "_selftest", headless=False)
+        p("launched_with=%s" % exe)
         pg = ctx.pages[0] if ctx.pages else ctx.new_page()
         pg.goto("about:blank", timeout=30000)
         p("page=ok")

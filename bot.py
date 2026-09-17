@@ -53,12 +53,57 @@ PROFILE = os.path.join(DATA_DIR, "chrome_profile")
 LOGDIR = os.path.join(DATA_DIR, "logs")
 
 
-def find_chrome():
-    """自动定位本机 Chrome / Edge，找不到返回空串"""
-    cands = []
+def portable_marks(exe):
+    """检测「便携改装版」Chrome（官方 Chrome / Edge 都不带这些）。
+
+    典型是 RunningCheese Chrome 等集成了 **Chrome++（shuax/Bush2021 的 version.dll DLL 劫持）**
+    的构建：Chrome++ 的便携化功能会**强制覆盖 data_dir / cache_dir**，把命令行里
+    `--user-data-dir=<我们的 profile>` 改写成它自己的便携目录。若该目录已被用户
+    日常浏览器实例占用，新进程会直接把请求转交给已有实例然后 **exit 0**，
+    Playwright 侧表现为 `Target page, context or browser has been closed`。
+    这类构建**无法做隔离 profile，也无法建立 CDP 连接**，只能尽量避开。
+    """
+    marks = []
+    if not exe:
+        return marks
+    d = os.path.dirname(exe)
+    if os.path.isfile(os.path.join(d, "version.dll")):
+        marks.append("version.dll(Chrome++)")
+    if os.path.isfile(os.path.join(d, "chrome++.ini")):
+        marks.append("chrome++.ini")
+    try:
+        if os.path.isdir(os.path.join(os.path.dirname(d), "Data")):
+            marks.append("..\\Data 便携目录")
+    except Exception:
+        pass
+    return marks
+
+
+def chrome_candidates():
+    """按优先级列出候选浏览器：[{exe,label,marks,rank,prio}]（rank 越小越优先）
+
+    0 = 官方 Chrome（无便携特征）
+    1 = Microsoft Edge（Win10/11 自带，官方二进制，自动化兼容好）
+    2 = 便携改装版（Chrome++ 等，最后才试）
+    """
+    raw = []
+    seen = set()
+
+    def add(p, prio):
+        if not p:
+            return
+        try:
+            p = os.path.abspath(p)
+        except Exception:
+            return
+        if p.lower() in seen or not os.path.isfile(p):
+            return
+        seen.add(p.lower())
+        raw.append((p, prio))
+
     env = os.environ.get("CHROME_PATH")
     if env:
-        cands.append(env)
+        add(env, -1)                       # 用户显式指定 -> 最高优先
     try:
         import winreg
         for root, sub in ((winreg.HKEY_LOCAL_MACHINE,
@@ -69,7 +114,7 @@ def find_chrome():
                            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msedge.exe")):
             try:
                 with winreg.OpenKey(root, sub) as k:
-                    cands.append(winreg.QueryValue(k, None))
+                    add(winreg.QueryValue(k, None), 0)
             except Exception:
                 pass
     except Exception:
@@ -78,19 +123,73 @@ def find_chrome():
         base = os.environ.get(var)
         if not base:
             continue
-        cands.append(os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"))
-        cands.append(os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"))
-    for c in cands:
-        if c and os.path.isfile(c):
-            return c
+        add(os.path.join(base, "Google", "Chrome", "Application", "chrome.exe"), 0)
+        add(os.path.join(base, "Microsoft", "Edge", "Application", "msedge.exe"), 0)
     for name in ("chrome", "msedge"):
-        p = shutil.which(name)
-        if p:
-            return p
-    return ""
+        add(shutil.which(name), 0)
+
+    out = []
+    for exe, prio in raw:
+        marks = portable_marks(exe)
+        is_edge = os.path.basename(exe).lower().startswith("msedge")
+        rank = 2 if marks else (1 if is_edge else 0)
+        label = "Edge" if is_edge else "Chrome"
+        if marks:
+            label += "（便携改装版：" + "、".join(marks) + "）"
+        out.append({"exe": exe, "label": label, "marks": marks,
+                    "rank": rank, "prio": prio})
+    out.sort(key=lambda c: (c["rank"], c["prio"], c["exe"].lower()))
+    return out
+
+
+def find_chrome():
+    """兼容旧接口：返回最优先的候选浏览器路径，找不到返回空串"""
+    c = chrome_candidates()
+    return c[0]["exe"] if c else ""
 
 
 CHROME = find_chrome()
+
+
+def launch_persistent(pw, user_data_dir, headless=False, viewport=(1500, 940)):
+    """按候选顺序启动持久化浏览器，返回 (ctx, exe)。
+
+    逐个候选尝试；每个候选重试 2 次（第一次失败通常是 profile 残留占用）。
+    便携改装版会强制改写 user-data-dir，因此排到最后并在日志里给出提示。
+    """
+    cands = chrome_candidates()
+    if not cands:
+        raise RuntimeError("未检测到 Chrome/Edge，请先安装 Google Chrome")
+    errs = []
+    warned = set()
+    for cand in cands:
+        exe = cand["exe"]
+        if cand["marks"] and exe not in warned:
+            warned.add(exe)
+            log("⚠️ 检测到便携改装版浏览器：%s" % exe)
+            log("   （%s 会强制改写 user-data-dir，自动化经常启动即退出，已排到最后尝试）"
+                % cand["label"])
+        for attempt in range(2):
+            try:
+                ctx = pw.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir, executable_path=exe, headless=headless,
+                    viewport={"width": viewport[0], "height": viewport[1]},
+                    args=["--disable-blink-features=AutomationControlled", "--no-first-run",
+                          "--no-default-browser-check"],
+                    ignore_default_args=["--enable-automation"])
+                return ctx, exe
+            except Exception as e:
+                errs.append("%s -> %s" % (os.path.basename(exe), str(e).split("\n")[0][:90]))
+                if attempt == 0:
+                    log("  %s 启动失败，清理残留后重试：%s"
+                        % (os.path.basename(exe), str(e).split("\n")[0][:70]))
+                    kill_stale_chrome()
+                    time.sleep(2)
+    raise RuntimeError(
+        "所有浏览器都启动失败（共试 %d 个）：\n  %s\n"
+        "提示：若上表里有 RunningCheese 等「便携改装版 Chrome」（带 Chrome++ / version.dll），"
+        "它会强制覆盖 user-data-dir，导致自动化无法启动 —— 请安装官方 Google Chrome，"
+        "或改用系统自带的 Microsoft Edge。" % (len(cands), "\n  ".join(errs)))
 
 # 技能体系硬上限（源码 SKILL_CONFIG 实测：maxLevel:6, maxActiveNum:5, maxPassiveNum:2）
 MAX_SKILL_LEVEL = 6      # 单技能满级（卡片显示 MAX / 终极形态）
@@ -733,23 +832,8 @@ class MagicKnightBot:
             raise RuntimeError("未检测到 Chrome/Edge 浏览器，请先安装 Google Chrome，"
                                "或设置环境变量 CHROME_PATH 指向 chrome.exe")
         self.pw = sync_playwright().start()
-        last_err = None
-        for attempt in range(3):
-            try:
-                self.ctx = self.pw.chromium.launch_persistent_context(
-                    user_data_dir=PROFILE, executable_path=CHROME, headless=self.headless,
-                    viewport={"width": 1500, "height": 940},
-                    args=["--disable-blink-features=AutomationControlled", "--no-first-run",
-                          "--no-default-browser-check"],
-                    ignore_default_args=["--enable-automation"])
-                break
-            except Exception as e:
-                last_err = e
-                log("Chrome 启动失败（第 %d 次）: %s，清理残留后重试" % (attempt + 1, str(e)[:80]))
-                self._kill_stale_chrome()
-                time.sleep(3)
-        else:
-            raise RuntimeError("Chrome 启动失败: %s" % last_err)
+        self.ctx, exe = launch_persistent(self.pw, PROFILE, headless=self.headless)
+        log("浏览器: %s" % exe)
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         self.panel_state = {"body": ""}
 
@@ -1392,12 +1476,8 @@ def open_login(timeout=900):
         raise RuntimeError("未检测到 Chrome/Edge 浏览器，请先安装 Google Chrome")
     kill_stale_chrome()
     pw = sync_playwright().start()
-    ctx = pw.chromium.launch_persistent_context(
-        user_data_dir=PROFILE, executable_path=CHROME, headless=False,
-        viewport={"width": 1360, "height": 900},
-        args=["--disable-blink-features=AutomationControlled", "--no-first-run",
-              "--no-default-browser-check"],
-        ignore_default_args=["--enable-automation"])
+    ctx, exe = launch_persistent(pw, PROFILE, headless=False, viewport=(1360, 900))
+    log("登录窗口使用的浏览器: %s" % exe)
     try:
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto("https://www.douyu.com", timeout=60000)
