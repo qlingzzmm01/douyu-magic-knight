@@ -23,6 +23,7 @@ import re
 import sys
 import json
 import time
+import random
 import shutil
 import argparse
 import datetime
@@ -809,18 +810,56 @@ def log(*a):
 
 
 class MagicKnightBot:
-    def __init__(self, rid=2561707, rounds=0, headless=False, no_move=False, god=False):
+    def __init__(self, rid=2561707, rounds=0, headless=False, no_move=False, god=False,
+                 gap_min=0.0, gap_max=0.0):
         self.panel_url = ("https://www.douyu.com/pages/vibe-lab-act202608-game/home"
                           "?rid=%d&isAnchorSide=0" % rid)
         self.rounds = rounds
         self.headless = headless
         self.no_move = no_move
         self.god = god
+        self.gap_min = float(gap_min or 0)   # 两局之间随机等待下限（分钟）
+        self.gap_max = float(gap_max or 0)   # 上限；<=0 表示不等待，立即开下一把
         self._stop = False            # GUI 停止按钮置 True，主循环各检查点退出
         os.makedirs(LOGDIR, exist_ok=True)
 
     def request_stop(self):
         self._stop = True
+
+    def round_gap(self):
+        """一局结束后到下一局之间的随机等待（分钟）。
+
+        未填 / 填 0 -> 立即开下一把。等待期间每秒检查停止信号，每 30 秒报一次剩余时间。
+        """
+        lo, hi = self.gap_min, self.gap_max
+        if hi <= 0 and lo <= 0:
+            log("随机间隔未设置 -> 立即开下一把")
+            return
+        if hi <= 0:                      # 只填了下限，按固定值处理
+            hi = lo
+        if lo > hi:
+            lo, hi = hi, lo
+        wait_s = random.uniform(lo, hi) * 60.0
+        pretty = ("约 %d 秒" % round(wait_s)) if wait_s < 60 else \
+                 ("约 %d 分 %02d 秒" % (int(wait_s // 60), int(wait_s % 60)))
+        log("随机间隔 %.1f~%.1f 分钟 -> 本局等待 %s 后开下一把" % (lo, hi, pretty))
+        nxt = time.time() + wait_s
+        last_log = time.time()
+        while True:
+            left = nxt - time.time()
+            if left <= 0:
+                break
+            if self._stop:
+                log("等待期间收到停止信号，退出")
+                return
+            time.sleep(min(1.0, left))
+            if time.time() - last_log >= 30:
+                last_log = time.time()
+                left = int(max(0, nxt - time.time()))
+                log("  距下一把还有 %d 分 %02d 秒" % (left // 60, left % 60))
+        if self._stop:
+            return
+        log("等待结束，开始下一把")
 
     # ---------- 基础 ----------
     @staticmethod
@@ -1445,6 +1484,11 @@ class MagicKnightBot:
                 idx += 1
                 self.run_battle(idx)
                 time.sleep(5)
+                if self.rounds and idx >= self.rounds:
+                    continue                 # 已是最后一局，不必等待
+                if self._stop:
+                    break
+                self.round_gap()             # 随机间隔（未设置则立即开下一把）
         except KeyboardInterrupt:
             log("手动停止")
         finally:
@@ -1527,7 +1571,9 @@ if __name__ == "__main__":
     ap.add_argument("--headless", action="store_true", help="无头模式")
     ap.add_argument("--no-move", action="store_true", help="只开局不走位")
     ap.add_argument("--god", action="store_true", help="无敌模式（setInvincible 常驻，真实免伤）")
+    ap.add_argument("--gap-min", type=float, default=0.0, help="两局之间随机等待下限（分钟），0=不等待")
+    ap.add_argument("--gap-max", type=float, default=0.0, help="两局之间随机等待上限（分钟），0=不等待")
     args = ap.parse_args()
     MagicKnightBot(rid=args.rid, rounds=args.rounds,
                    headless=args.headless, no_move=args.no_move,
-                   god=args.god).run()
+                   god=args.god, gap_min=args.gap_min, gap_max=args.gap_max).run()

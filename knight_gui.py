@@ -76,9 +76,22 @@ class App:
         ttk.Button(top, text="打开数据目录", width=12, command=self.open_dir)\
             .grid(row=0, column=8)
 
+        # ---- 两局之间的随机等待（分钟）----
+        ttk.Label(top, text="下一把随机间隔(分钟)", font=FONT)\
+            .grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.gap_min = tk.StringVar(value="")
+        self.gap_max = tk.StringVar(value="")
+        gap_box = ttk.Frame(top)
+        gap_box.grid(row=2, column=2, columnspan=4, sticky="w", pady=(8, 0))
+        ttk.Entry(gap_box, textvariable=self.gap_min, width=6, font=FONT).pack(side="left")
+        ttk.Label(gap_box, text="~", font=FONT).pack(side="left", padx=4)
+        ttk.Entry(gap_box, textvariable=self.gap_max, width=6, font=FONT).pack(side="left")
+        ttk.Label(gap_box, text="分钟   （留空 / 0 = 立即开下一把）",
+                  font=("Microsoft YaHei UI", 9), foreground="#666").pack(side="left", padx=(8, 0))
+
         tips = ttk.Label(top, text="无敌=真实免伤+只主动打精英/Boss(其余时间专心吃经验)；关闭=常规躲避流",
                          font=("Microsoft YaHei UI", 9), foreground="#666")
-        tips.grid(row=1, column=0, columnspan=9, sticky="w", pady=(6, 0))
+        tips.grid(row=3, column=0, columnspan=9, sticky="w", pady=(6, 0))
 
         self.status = tk.StringVar(value="状态：未运行")
         ttk.Label(self.root, textvariable=self.status, anchor="w", padding=(10, 4),
@@ -122,6 +135,13 @@ class App:
                     self.last_hud = ("剩余 %s | 击杀 %s | 金币 %s | 血 %s | 无敌 %s"
                                      % (m2.group(1), m2.group(2), m2.group(3),
                                         m2.group(4), m2.group(5)))
+                m3 = re.search(r"距下一把还有 (\S+) 分 (\S+) 秒", line)
+                if m3:
+                    self.last_hud = "等待下一把 · 还有 %s 分 %s 秒" % (m3.group(1), m3.group(2))
+                if "随机间隔" in line and "本局等待" in line:
+                    self.last_hud = line.split("] ")[-1].strip()
+                if "立即开下一把" in line:
+                    self.last_hud = "立即开下一把"
                 if self.running:
                     self.status.set("运行中 · %s | 无敌 %s"
                                     % (self.last_hud or "启动中", "开" if self.god else "关"))
@@ -156,20 +176,41 @@ class App:
         except ValueError:
             messagebox.showwarning("输入错误", "房间号和局数必须是数字")
             return
+        # 随机间隔（分钟）：留空 = 0 = 立即开下一把
+        try:
+            gap_min = float((self.gap_min.get() or "0").strip() or 0)
+            gap_max = float((self.gap_max.get() or "0").strip() or 0)
+        except ValueError:
+            messagebox.showwarning("输入错误", "随机间隔必须是数字（分钟），可以留空")
+            return
+        if gap_min < 0 or gap_max < 0:
+            messagebox.showwarning("输入错误", "随机间隔不能是负数")
+            return
+        if gap_max <= 0 and gap_min > 0:      # 只填了前面一格 -> 当成固定间隔
+            gap_max = gap_min
+        if gap_min > gap_max:                 # 填反了就自动交换
+            gap_min, gap_max = gap_max, gap_min
+            self.gap_min.set("%g" % gap_min)
+            self.gap_max.set("%g" % gap_max)
         self.running = True
         self.last_hud = ""
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self.status.set("启动中… 房间 %d | 无敌 %s" % (rid, "开" if self.god else "关"))
-        self._log("[系统] 开始挂机：房间 %d，局数 %s，无敌 %s"
-                  % (rid, rounds or "不限", "开" if self.god else "关"), "god" if self.god else None)
-        self.thread = threading.Thread(target=self._run, args=(rid, rounds), daemon=True)
+        gap_txt = ("立即开下一把" if gap_max <= 0
+                   else "随机 %.1f~%.1f 分钟" % (gap_min, gap_max))
+        self._log("[系统] 开始挂机：房间 %d，局数 %s，无敌 %s，间隔 %s"
+                  % (rid, rounds or "不限", "开" if self.god else "关", gap_txt),
+                  "god" if self.god else None)
+        self.thread = threading.Thread(target=self._run,
+                                       args=(rid, rounds, gap_min, gap_max), daemon=True)
         self.thread.start()
 
-    def _run(self, rid, rounds):
+    def _run(self, rid, rounds, gap_min=0.0, gap_max=0.0):
         try:
             botmod.MagicKnightBot._kill_stale_chrome()
-            self.bot = botmod.MagicKnightBot(rid=rid, rounds=rounds, god=self.god)
+            self.bot = botmod.MagicKnightBot(rid=rid, rounds=rounds, god=self.god,
+                                             gap_min=gap_min, gap_max=gap_max)
             self.bot.run()
         except Exception as e:
             self._log("[异常] %s" % e, "warn")
@@ -279,6 +320,8 @@ def cli_run(argv):
     ap.add_argument("--rid", type=int, default=2561707)
     ap.add_argument("--rounds", type=int, default=0)
     ap.add_argument("--headless", action="store_true")
+    ap.add_argument("--gap-min", type=float, default=0.0, help="两局之间随机等待下限（分钟）")
+    ap.add_argument("--gap-max", type=float, default=0.0, help="两局之间随机等待上限（分钟）")
     a = ap.parse_args(argv)
     os.makedirs(botmod.DATA_DIR, exist_ok=True)
     logf = os.path.join(botmod.DATA_DIR, "run.log")
@@ -291,10 +334,12 @@ def cli_run(argv):
             pass
 
     botmod.add_log_sink(sink)
-    botmod.log("=== CLI 启动 rid=%s rounds=%s god=%s ===" % (a.rid, a.rounds, a.god))
+    botmod.log("=== CLI 启动 rid=%s rounds=%s god=%s gap=%s~%s ==="
+               % (a.rid, a.rounds, a.god, a.gap_min, a.gap_max))
     botmod.MagicKnightBot._kill_stale_chrome()
     botmod.MagicKnightBot(rid=a.rid, rounds=a.rounds, god=a.god,
-                          headless=a.headless).run()
+                          headless=a.headless,
+                          gap_min=a.gap_min, gap_max=a.gap_max).run()
 
 
 def cli_login():
